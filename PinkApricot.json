@@ -1,8 +1,8 @@
 {
   "listen_address": ":9270",
   "metric_path": "/metrics",
-  "config_source": "file",
-  "source_location": "mysql://root:root@localhost:3306",
+  "config_source": "mysql",
+  "source_location": "mysql://root:root@localhost:3306/PinkApricot",
   "config_name": "PinkApricot",
   "collector": {
     "query_mode": "async",
@@ -30,15 +30,12 @@
       {
         "name": "slow_query_count",
         "is_template_query": true,
-        "collect_interval": "minute",
-        "collect_point": "0",
-        "cache_last_collection": true,
-        "query": "SELECT db as db, user_host as user_host, __time_range__ as time_range, COUNT(*) as __query_time_label__ FROM mysql.slow_log WHERE start_time > __start_time__ AND UNIX_TIMESTAMP(query_time) > __query_time__ GROUP BY db, user_host"
+        "query": "SELECT db as db, user_host as user_host, __time_range__ as time_range, COUNT(*) as __query_time_label__ FROM mysql.slow_log WHERE start_time > __start_time__ AND query_time > __query_time__ GROUP BY db, user_host"
       }
     ],
     "targets": [
       {
-        "data_source": "mysql://root:root@localhost:3306",
+        "data_source": "mysql://root:root@localhost:3306/mysql",
         "queries": ["slow_query_count"]
       }
     ],
@@ -57,11 +54,11 @@
         "query_time": [
           {
           "query_time_label": "exceed_10s",
-          "query_time": 10
+          "query_time": "00:00:10"
           },
           {
             "query_time_label": "exceed_60s",
-            "query_time": 60
+            "query_time": "00:01:00"
           }
         ]
       }

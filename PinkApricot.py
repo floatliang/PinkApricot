@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Iterable
 import dsnparse
 import pymysql
 from flask import Flask, Response
-from prometheus_client import Gauge, generate_latest
+from prometheus_client import Gauge, generate_latest, REGISTRY
 
 DEFAULT_LISTEN_ADDRESS = ":9270"
 DEFAULT_METRICS_PATH = "/metrics"
@@ -428,10 +428,10 @@ class Config(object):
     @staticmethod
     def _load_from_mydb(dbi: MyDBApi, config_name: str) -> Dict:
         res = dbi.query("SELECT config FROM PinkApricot.ExporterConfig WHERE config_name = '{}' "
-                        "ORDER BY version".format(config_name), ())
+                        "ORDER BY version LIMIT 1".format(config_name), ())
         if res is None or len(res) == 0:
             raise Exception("no config named {} exists in mydb".format(config_name))
-        return json.loads(res["config"])["collector"]
+        return json.loads(res[0]["config"])["collector"]
 
 
 class MetricFamily(object):
@@ -448,6 +448,10 @@ class MetricFamily(object):
         if config.val_label is not None and len(config.val_label) > 0:
             labels.append(config.val_label)
         if config.metric_type == "gauge":
+            try:
+                REGISTRY.unregister(config.name)
+            except KeyError:
+                pass
             self.metric = Gauge(config.name, config.description, labels)
         else:
             raise Exception("not supported metric type: {}".format(config.metric_type))
@@ -632,8 +636,8 @@ class Query(object):
     def collect_from_cache(self):
         """
         reuse cached last collection and won't do a actual query
-        :return:
         """
+        self.last_collection.collect_metrics_from_cache()
 
     def run(self, query: str, param: Dict):
         """
@@ -803,8 +807,8 @@ class MyDBApi(DBApi):
                 cursor.execute(sql, param)
                 results = cursor.fetchall()
         except Exception as ex:
-            self._log(sql, param)
             raise ex
+        self._log(sql, param)
         return results
 
     def query_one(self, sql: str, param: Iterable, t=None):
@@ -816,8 +820,8 @@ class MyDBApi(DBApi):
                 cursor.execute(sql, param)
                 result = cursor.fetchone()
         except Exception as ex:
-            self._log(sql, param)
             raise ex
+        self._log(sql, param)
         return result
 
     def query(self, sql: str, param: Iterable, t=None):
@@ -826,7 +830,6 @@ class MyDBApi(DBApi):
 
 if __name__ == '__main__':
     opts, args = getopt.getopt(sys.argv[1:], "hl:p:c:", ["help", "listen-address=", "metric-path=", "config-file="])
-    print("Starting PinkApricot Exporter...")
 
     listen_addr = DEFAULT_LISTEN_ADDRESS
     metrics_path = DEFAULT_METRICS_PATH
@@ -854,14 +857,19 @@ if __name__ == '__main__':
     else:
         raise Exception("invalid listen address: {}".format(listen_addr))
 
+    print("Starting PinkApricot Exporter...")
     # initial exporter
     exporter_config = Config.load(config_file)
+    if exporter_config.listen_address is None or len(exporter_config.listen_address) == 0:
+        exporter_config.listen_address = listen_addr
+    if exporter_config.metric_path is None or len(exporter_config.metric_path) == 0:
+        exporter_config.metric_path = metrics_path
     exporter = Collector(exporter_config.collector)
 
     # initial http app
     app = Flask(__name__)
 
-    @app.route(metrics_path)
+    @app.route(exporter_config.metric_path)
     def exporter_handler():
         """
         prometheus pull request handler
