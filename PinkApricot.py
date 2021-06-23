@@ -11,7 +11,9 @@ import getopt
 import json
 import re
 import sys
+import traceback
 from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED, Future
+from contextlib import suppress
 from copy import deepcopy
 from datetime import datetime, timezone, timedelta
 from threading import Lock
@@ -85,7 +87,7 @@ class Configs(object):
             return query
         for k, v in params.items():
             ph = Configs.PLACEHOLDER + k + Configs.PLACEHOLDER
-            query.replace(ph, "%({})s".format(k))
+            query = query.replace(ph, "%({})s".format(k))
         return query
 
     @staticmethod
@@ -112,25 +114,22 @@ class Configs(object):
                 neg = 1 if gd["op"] == "+" else -1
                 num = int(gd["num"])
                 if gd["unit"] == "s":
-                    date = datetime(now.year, now.month, now.day, now.hour, now.minute,
-                                    now.second + neg * num, tzinfo=now.tzinfo)
+                    date = now + timedelta(seconds=neg * num)
                 elif gd["unit"] == "m":
-                    date = datetime(now.year, now.month, now.day, now.hour, now.minute + neg * num,
-                                    now.second, tzinfo=now.tzinfo)
+                    date = now + timedelta(minutes=neg * num)
                 elif gd["unit"] == "h":
-                    date = datetime(now.year, now.month, now.day, now.hour + neg * num,
-                                    now.minute, now.second, tzinfo=now.tzinfo)
+                    date = now + timedelta(hours=neg * num)
                 elif gd["unit"] == "d":
-                    date = datetime(now.year, now.month, now.day + neg * num, now.hour,
-                                    now.minute, now.second, tzinfo=now.tzinfo)
+                    date = now + timedelta(days=neg * num)
                 else:
-                    return date
+                    return date.strftime("%Y-%m-%dT%H:%M:%S%Z")
             if "floor" in gd:
                 if gd["floor"] == "[ld]":
-                    date = datetime(now.year, now.month, now.day, tzinfo=now.tzinfo)
+                    date = datetime(date.year, date.month, date.day, tzinfo=date.tzinfo)
                 elif gd["floor"] == "[rd]":
-                    date = datetime(now.year, now.month, now.day + 1, tzinfo=now.tzinfo)
-            return date
+                    date = date + timedelta(days=1)
+                    date = datetime(date.year, date.month, date.day, tzinfo=date.tzinfo)
+            return date.strftime("%Y-%m-%dT%H:%M:%S%Z")
         elif key.startswith(ReferencedFunctions.REFERENCE_HINT):
             if hasattr(ReferencedFunctions, key):
                 try:
@@ -312,9 +311,7 @@ class CollectorConfig(object):
             return params
         now = datetime.now(tz=timezone(timedelta(hours=8)))
 
-        common_params = deepcopy(self.query_params["common_params"])
-        if common_params is None or len(common_params) == 0:
-            return params
+        common_params = deepcopy(self.query_params.get("common_params", {}))
         cached_placeholder = {}
 
         # resolve common params
@@ -428,7 +425,7 @@ class Config(object):
     @staticmethod
     def _load_from_mydb(dbi: MyDBApi, config_name: str) -> Dict:
         res = dbi.query("SELECT config FROM PinkApricot.ExporterConfig WHERE config_name = '{}' "
-                        "ORDER BY version LIMIT 1".format(config_name), ())
+                        "ORDER BY version DESC LIMIT 1".format(config_name), ())
         if res is None or len(res) == 0:
             raise Exception("no config named {} exists in mydb".format(config_name))
         return json.loads(res[0]["config"])["collector"]
@@ -448,10 +445,6 @@ class MetricFamily(object):
         if config.val_label is not None and len(config.val_label) > 0:
             labels.append(config.val_label)
         if config.metric_type == "gauge":
-            try:
-                REGISTRY.unregister(config.name)
-            except KeyError:
-                pass
             self.metric = Gauge(config.name, config.description, labels)
         else:
             raise Exception("not supported metric type: {}".format(config.metric_type))
@@ -487,6 +480,9 @@ class MetricFamily(object):
             self.metric.set(metric_val)
             if need_cache:
                 cache.cache(self.metric, label_values, metric_val)
+
+    def close(self):
+        REGISTRY.unregister(self.metric)
 
 
 class CachedMetricCollection(object):
@@ -535,7 +531,7 @@ class Query(object):
         self.last_collect_point: int = 0
         self.last_collection: CachedMetricCollection = CachedMetricCollection()
         self._executor: Optional[ThreadPoolExecutor] = None
-        self._target: Optional[DBApi] = None
+        self._target: Optional[TargetConfig] = None
 
     def set_metric_families(self, mfs: List[MetricFamily]):
         self.mfs = mfs
@@ -543,11 +539,11 @@ class Query(object):
     def set_executor(self, executor: ThreadPoolExecutor):
         self._executor = executor
 
-    def set_target(self, target: DBApi):
+    def set_target(self, target: TargetConfig):
         self._target = target
 
     @property
-    def target(self):
+    def target(self) -> TargetConfig:
         return self._target
 
     @property
@@ -645,7 +641,7 @@ class Query(object):
         :param query: sql to execute
         :param param: sql param to fill in
         """
-        rows = self._target.query(query, param)
+        rows = self._target.init_db_connection().query(query, param)
         with self._lock:
             for row in rows:
                 for mf in self.mfs:
@@ -662,7 +658,8 @@ class Query(object):
         :param task: task to execute
         """
         if task.exception():
-            print("failed to execute query asynchronously: {}".format(task.exception()))
+            print("failed to execute query asynchronously: \n")
+            traceback.print_tb(task.exception().__traceback__)
 
 
 class Collector(object):
@@ -682,11 +679,10 @@ class Collector(object):
 
         # init targets
         for target_config in config.targets:
-            target = target_config.init_db_connection()
             for query_name in target_config.queries:
                 if named_queries[query_name].target is not None:
                     raise Exception("one query not supported execute on multiple target")
-                named_queries[query_name].set_target(target)
+                named_queries[query_name].set_target(target_config)
 
         self.query_mfs: Dict[Query, List[MetricFamily]] = {}
 
@@ -740,11 +736,19 @@ class Collector(object):
         for cq in cached_queries:
             cq.collect_from_cache()
 
+    def close(self):
+        for _, metrics in self.query_mfs.items():
+            for metric in metrics:
+                metric.close()
+
 
 class DBApi(object):
     """
     db operation interface
     """
+
+    def clone(self):
+        raise NotImplementedError()
 
     def close(self):
         raise NotImplementedError()
@@ -766,13 +770,14 @@ class MyDBApi(DBApi):
     DEFAULT_CONFIG = {
         'host': 'localhost',
         'user': 'root',
-        'db': 'EXPORTER_CONFIG',
+        'db': 'PinkApricot',
         'charset': 'utf8',
         'autocommit': 0,  # default 0
         'cursorclass': pymysql.cursors.DictCursor
     }
 
     def __init__(self, dsn: dsnparse.ParseResult = None):
+        self.dsn = dsn
         if dsn:
             self.config: Dict = {
                 "host": dsn.host,
@@ -788,6 +793,9 @@ class MyDBApi(DBApi):
         else:
             self.config: Dict = MyDBApi.DEFAULT_CONFIG.copy()
         self.conn = pymysql.connect(**self.config)
+
+    def clone(self):
+        return MyDBApi(self.dsn)
 
     @classmethod
     def _log(cls, sql: str, param: Iterable):
@@ -858,6 +866,11 @@ if __name__ == '__main__':
         raise Exception("invalid listen address: {}".format(listen_addr))
 
     print("Starting PinkApricot Exporter...")
+    # unregister internal metrics
+    for name in list(REGISTRY._names_to_collectors.values()):
+        with suppress(KeyError):
+            REGISTRY.unregister(name)
+
     # initial exporter
     exporter_config = Config.load(config_file)
     if exporter_config.listen_address is None or len(exporter_config.listen_address) == 0:
@@ -891,9 +904,10 @@ if __name__ == '__main__':
         """
         refresh exporter config and create a new exporter with it
         """
-        exporter_config.refresh_collector_config()
-        new_exporter = Collector(exporter_config.collector)
         global exporter
+        exporter_config.refresh_collector_config()
+        exporter.close()
+        new_exporter = Collector(exporter_config.collector)
         exporter = new_exporter
         return Response("refreshed!")
 

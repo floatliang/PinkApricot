@@ -9,7 +9,7 @@ with open("README.md", "r") as fh:
     long_description = fh.read()
 setup(
     name='PinkApricot',
-    version="0.0.1",
+    version="0.0.2",
     description='PinkApricot is configurable sql exporter not only export metrics but also love :)',
     packages=find_packages(exclude=['test']),
     url='https://github.com/floatliang/PinkApricot',
