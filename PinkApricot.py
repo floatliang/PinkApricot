@@ -15,7 +15,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED, Future
 from contextlib import suppress
 from copy import deepcopy
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, tzinfo
 from threading import Lock
 from typing import Dict, List, Optional, Iterable
 
@@ -23,6 +23,7 @@ import dsnparse
 import pymysql
 from flask import Flask, Response
 from prometheus_client import Gauge, generate_latest, REGISTRY
+import pytz
 
 DEFAULT_LISTEN_ADDRESS = ":9270"
 DEFAULT_METRICS_PATH = "/metrics"
@@ -79,6 +80,17 @@ class Configs(object):
             if isinstance(obj, str) else None, False
 
     @staticmethod
+    def contains_placeholder(obj) -> (str, bool):
+        if isinstance(obj, str):
+            head = obj.find(Configs.PLACEHOLDER)
+            tail = obj.rfind(Configs.PLACEHOLDER)
+            if head < 0 or tail < 0 or tail <= head + len(Configs.PLACEHOLDER):
+                return None, False
+            return obj[head: tail + len(Configs.PLACEHOLDER)], True
+        else:
+            return None, False
+
+    @staticmethod
     def accept_query_params(query: str, params: Dict) -> str:
         """
         sql placeholder accept its parameters
@@ -87,7 +99,7 @@ class Configs(object):
             return query
         for k, v in params.items():
             ph = Configs.PLACEHOLDER + k + Configs.PLACEHOLDER
-            query = query.replace(ph, "%({})s".format(k))
+            query = query.replace(ph, str(v))
         return query
 
     @staticmethod
@@ -122,14 +134,14 @@ class Configs(object):
                 elif gd["unit"] == "d":
                     date = now + timedelta(days=neg * num)
                 else:
-                    return date.strftime("%Y-%m-%dT%H:%M:%S%Z")
+                    return date.strftime("%Y-%m-%d %H:%M:%S")
             if "floor" in gd:
                 if gd["floor"] == "[ld]":
                     date = datetime(date.year, date.month, date.day, tzinfo=date.tzinfo)
                 elif gd["floor"] == "[rd]":
                     date = date + timedelta(days=1)
                     date = datetime(date.year, date.month, date.day, tzinfo=date.tzinfo)
-            return date.strftime("%Y-%m-%dT%H:%M:%S%Z")
+            return date.strftime("%Y-%m-%d %H:%M:%S")
         elif key.startswith(ReferencedFunctions.REFERENCE_HINT):
             if hasattr(ReferencedFunctions, key):
                 try:
@@ -256,18 +268,21 @@ class MetricConfig(object):
 class CollectorConfig(object):
     REQUIRED_CONFIG_KEY = {
         "metrics": True, "queries": True, "targets": True,
-        "query_params": False, "query_mode": False, "max_query_workers": False
+        "query_params": False, "query_mode": False,
+        "max_query_workers": False, "time_zone": False
     }
+    DEFAULT_TIME_ZONE = pytz.timezone("Asia/Shanghai")
 
     def __init__(self, metrics: List[MetricConfig], queries: List[QueryConfig],
-                 targets: List[TargetConfig], query_params: Dict,
-                 query_mode: str = "async", max_query_workers: int = 10):
+                 targets: List[TargetConfig], query_params: Dict, query_mode: str = "async",
+                 max_query_workers: int = 10, time_zone: timezone = DEFAULT_TIME_ZONE):
         self.metrics: List[MetricConfig] = metrics
         self.queries: List[QueryConfig] = queries
         self.targets: List[TargetConfig] = targets
         self.query_params: Dict = query_params
         self.query_mode: str = query_mode
         self.max_query_workers: int = max_query_workers
+        self.time_zone: timezone = time_zone
 
     @staticmethod
     def load(config: Dict) -> CollectorConfig:
@@ -285,7 +300,8 @@ class CollectorConfig(object):
             metrics, queries, targets,
             config.get("query_params", {}),
             config.get("query_mode", "async"),
-            config.get("max_query_workers", 10)
+            config.get("max_query_workers", 10),
+            pytz.timezone(config.get("time_zone", "Asia/Shanghai"))
         )
 
     @staticmethod
@@ -300,6 +316,15 @@ class CollectorConfig(object):
                 val = Configs.resolve_config_placeholder(ph, now)
                 cached_placeholder[ph] = val
                 return val
+        else:
+            cph, ok = Configs.contains_placeholder(ph)
+            if ok:
+                if cph in cached_placeholder:
+                    return ph.replace(cph, str(cached_placeholder[ph]))
+                else:
+                    val = Configs.resolve_config_placeholder(cph, now)
+                    cached_placeholder[cph] = val
+                    return ph.replace(cph, str(val))
         return None
 
     def spawn_query_params(self, query_names: List[str]) -> Dict:
@@ -309,7 +334,7 @@ class CollectorConfig(object):
         params = {}
         if self.query_params is None or len(self.query_params) == 0:
             return params
-        now = datetime.now(tz=timezone(timedelta(hours=8)))
+        now = datetime.now(tz=self.time_zone)
 
         common_params = deepcopy(self.query_params.get("common_params", {}))
         cached_placeholder = {}
@@ -460,7 +485,7 @@ class MetricFamily(object):
                 target_ref = ref
                 break
         if target_ref is None:
-            print("metric {} cannot reference query {]".format(self.config.name, query_name))
+            print("metric {} cannot reference query {}".format(self.config.name, query_name))
             return
         label_values = list(self.const_label_values)
         for label in self.non_const_key_labels:
@@ -475,9 +500,8 @@ class MetricFamily(object):
                 continue
             if self.config.val_label is not None and len(self.config.val_label) > 0:
                 label_values.append(val_label_val)
-            self.metric.labels(label_values)
             metric_val = float(row[val_label_val])
-            self.metric.set(metric_val)
+            self.metric.labels(*label_values).set(metric_val)
             if need_cache:
                 cache.cache(self.metric, label_values, metric_val)
 
@@ -510,8 +534,7 @@ class CachedMetricCollection(object):
 
     def collect_metrics_from_cache(self):
         for idx, metric in enumerate(self.metrics):
-            metric.labels(self.label_values_collection[idx])
-            metric.set(self.value_collection[idx])
+            metric.labels(self.label_values_collection[idx]).set(self.value_collection[idx])
 
 
 class Query(object):
@@ -521,7 +544,12 @@ class Query(object):
      2. one target, through queries.
 
     when it is a template query, it can spawn one or more queries
-    to execute in a certain collect action
+    to execute in a certain collect action.
+
+    template query has two types of placeholder:
+    1. __db__ which will resolved by PinkApricot with parameter
+       named `db` in query_params before querying
+    2. %(db)s which will resolved by db driver during querying
     """
 
     def __init__(self, config: QueryConfig):
@@ -566,27 +594,27 @@ class Query(object):
             return True
         elif self.config.collect_in_minute_interval():
             cur_collect_point = "{}-{}-{}-{}".format(now.year, now.month, now.day, now.hour)
-            return self._check_collect_point(now, cur_collect_point)
+            return self._check_collect_point(now.minute, cur_collect_point)
         elif self.config.collect_in_hour_interval():
             cur_collect_point = "{}-{}-{}".format(now.year, now.month, now.day)
-            return self._check_collect_point(now, cur_collect_point)
+            return self._check_collect_point(now.hour, cur_collect_point)
         elif self.config.collect_in_day_interval():
             cur_collect_point = "{}-{}".format(now.year, now.month)
-            return self._check_collect_point(now, cur_collect_point)
+            return self._check_collect_point(now.day, cur_collect_point)
         else:
             return True
 
-    def _check_collect_point(self, now: datetime, cur_collect_point: str) -> bool:
+    def _check_collect_point(self, now: int, cur_collect_point: str) -> bool:
         with self._lock:
             if self.config.collect_once:
                 if cur_collect_point == self.last_collect_point:
                     return False
-                if now.hour == self.config.collect_point:
+                if now == self.config.collect_point:
                     self.last_collect_point = cur_collect_point
                     return True
                 return False
             else:
-                return now.hour == self.config.collect_point
+                return now == self.config.collect_point
 
     def collect(self, params: List[Dict]) -> Optional[List[Future]]:
         """
@@ -658,8 +686,7 @@ class Query(object):
         :param task: task to execute
         """
         if task.exception():
-            print("failed to execute query asynchronously: \n")
-            traceback.print_tb(task.exception().__traceback__)
+            print("failed to execute query asynchronously: {}".format(task.exception()))
 
 
 class Collector(object):
@@ -725,7 +752,7 @@ class Collector(object):
 
         tasks = []
         params = self.config.spawn_query_params(query_names)
-        for q in self.queries:
+        for q in queries:
             ret = q.collect(params[q.query_name])
             if ret is not None:
                 tasks.extend(ret)
@@ -867,9 +894,9 @@ if __name__ == '__main__':
 
     print("Starting PinkApricot Exporter...")
     # unregister internal metrics
-    for name in list(REGISTRY._names_to_collectors.values()):
+    for cn in list(REGISTRY._names_to_collectors.values()):
         with suppress(KeyError):
-            REGISTRY.unregister(name)
+            REGISTRY.unregister(cn)
 
     # initial exporter
     exporter_config = Config.load(config_file)
@@ -882,6 +909,7 @@ if __name__ == '__main__':
     # initial http app
     app = Flask(__name__)
 
+
     @app.route(exporter_config.metric_path)
     def exporter_handler():
         """
@@ -891,6 +919,7 @@ if __name__ == '__main__':
         exporter.gather()
         return Response(generate_latest(), mimetype="text/plain")
 
+
     @app.route("/health")
     def health():
         """
@@ -898,6 +927,7 @@ if __name__ == '__main__':
         :return: i'm ok
         """
         return Response("OK")
+
 
     @app.route("/config/refresh")
     def refresh_config():
@@ -910,6 +940,7 @@ if __name__ == '__main__':
         new_exporter = Collector(exporter_config.collector)
         exporter = new_exporter
         return Response("refreshed!")
+
 
     print("Listening on {}:{}".format(host, port))
     # start app
