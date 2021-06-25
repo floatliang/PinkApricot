@@ -871,7 +871,12 @@ if __name__ == '__main__':
     config_file = DEFAULT_CONFIG_FILE
     for opt, arg in opts:
         if opt in ("-h", "--help"):
-            print("python sql_exporter.py -l xx -p xx -c xx")
+            print("--listen-address -l string")
+            print("    Exporter listen address. (default ':9270')")
+            print("--metric-path -p string")
+            print("    Prometheus pull metric path (default '/metrics')")
+            print("--config-file -c string")
+            print("    Exporter config file location (default 'PinkApricot.json')")
             exit(0)
         elif opt in ("-l", "--listen-address"):
             listen_addr = arg
