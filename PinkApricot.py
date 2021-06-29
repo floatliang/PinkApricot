@@ -466,7 +466,7 @@ class Config(object):
 
     @staticmethod
     def _load_from_mydb(dbi: MyDBApi, config_name: str) -> Dict:
-        res = dbi.query("SELECT config FROM PinkApricot.ExporterConfig WHERE config_name = '{}' "
+        res = dbi.query("SELECT config FROM ExporterConfig WHERE config_name = '{}' "
                         "ORDER BY version DESC LIMIT 1".format(config_name), ())
         if res is None or len(res) == 0:
             raise Exception("no config named {} exists in mydb".format(config_name))
@@ -905,18 +905,6 @@ if __name__ == '__main__':
             metrics_path = arg
         elif opt in ("-c", "--config-file"):
             config_file = arg
-    host_port = listen_addr.split(":")
-    host = "localhost"
-    port = 9270
-    if len(host_port) == 1:
-        # listen_addr == "127.0.0.1" style
-        host = host_port[0]
-    elif len(host_port) == 2:
-        # listen_addr == "127.0.0.1:9270" or ":9270" style
-        host = "localhost" if not host_port[0] else host_port[0]
-        port = host_port[1]
-    else:
-        raise Exception("invalid listen address: {}".format(listen_addr))
 
     print("Starting PinkApricot Exporter...")
     # unregister internal metrics
@@ -968,6 +956,18 @@ if __name__ == '__main__':
         return Response("refreshed!")
 
 
+    host_port = exporter_config.listen_address.split(":")
+    host = "localhost"
+    port = 9270
+    if len(host_port) == 1:
+        # listen_addr == "127.0.0.1" style
+        host = host_port[0]
+    elif len(host_port) == 2:
+        # listen_addr == "127.0.0.1:9270" or ":9270" style
+        host = "0.0.0.0" if not host_port[0] else host_port[0]
+        port = host_port[1]
+    else:
+        raise Exception("invalid listen address: {}".format(listen_addr))
     print("Listening on {}:{}".format(host, port))
     # start app
     app.run(host=host, port=port)
