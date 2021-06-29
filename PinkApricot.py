@@ -11,19 +11,18 @@ import getopt
 import json
 import re
 import sys
-import traceback
 from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED, Future
 from contextlib import suppress
 from copy import deepcopy
-from datetime import datetime, timezone, timedelta, tzinfo
+from datetime import datetime, timezone, timedelta
 from threading import Lock
 from typing import Dict, List, Optional, Iterable
 
 import dsnparse
 import pymysql
+import pytz
 from flask import Flask, Response
 from prometheus_client import Gauge, generate_latest, REGISTRY
-import pytz
 
 DEFAULT_LISTEN_ADDRESS = ":9270"
 DEFAULT_METRICS_PATH = "/metrics"
@@ -57,7 +56,7 @@ class Configs(object):
     """
     PLACEHOLDER = "__"
 
-    NOW_PATTERN = re.compile(r"^now(?P<op>[-+])?(?P<num>\d+)?(?P<unit>[yMwdhHms])?(?P<floor>\[[lr]d])?\s*$")
+    NOW_PATTERN = re.compile(r"^now(?P<op>[-+])?(?P<num>\d+)?(?P<unit>[yMwdhHms])?(?P<spec>\[(ld|rd|date)])?\s*$")
 
     @staticmethod
     def check_config_key(config: Dict, requirement: Dict):
@@ -118,11 +117,12 @@ class Configs(object):
         # time type placeholder
         matches = Configs.NOW_PATTERN.match(key)
         if matches is not None:
+            fmt = "%Y-%m-%d %H:%M:%S"
             gd = matches.groupdict()
             date = None
-            if len(gd) == 0:
+            if not gd["unit"] and not gd["num"] and not gd["op"]:
                 date = now
-            elif len(gd) >= 3:
+            elif gd["unit"] and gd["num"] and gd["op"]:
                 neg = 1 if gd["op"] == "+" else -1
                 num = int(gd["num"])
                 if gd["unit"] == "s":
@@ -133,15 +133,17 @@ class Configs(object):
                     date = now + timedelta(hours=neg * num)
                 elif gd["unit"] == "d":
                     date = now + timedelta(days=neg * num)
-                else:
-                    return date.strftime("%Y-%m-%d %H:%M:%S")
-            if "floor" in gd:
-                if gd["floor"] == "[ld]":
+            else:
+                print("invalid now time format: {}".format(key))
+            if "spec" in gd:
+                if gd["spec"] == "[ld]":
                     date = datetime(date.year, date.month, date.day, tzinfo=date.tzinfo)
-                elif gd["floor"] == "[rd]":
+                elif gd["spec"] == "[rd]":
                     date = date + timedelta(days=1)
                     date = datetime(date.year, date.month, date.day, tzinfo=date.tzinfo)
-            return date.strftime("%Y-%m-%d %H:%M:%S")
+                elif gd["spec"] == "[date]":
+                    fmt = "%Y-%m-%d"
+            return date.strftime(fmt)
         elif key.startswith(ReferencedFunctions.REFERENCE_HINT):
             if hasattr(ReferencedFunctions, key):
                 try:
@@ -164,6 +166,7 @@ class TargetConfig(object):
     the target to monitor and the queries to execute on it
     """
     REQUIRED_CONFIG_KEY = {"data_source": True, "queries": True}
+    DSN_PLACEHOLDER = "__AT__"
 
     def __init__(self, data_source: str, query_names: List[str]):
         self.data_source = data_source
@@ -174,10 +177,24 @@ class TargetConfig(object):
         Configs.check_config_key(config, TargetConfig.REQUIRED_CONFIG_KEY)
         return TargetConfig(config["data_source"], config["queries"])
 
+    @staticmethod
+    def safe_parse_dsn(data_source: str) -> dsnparse.ParseResult:
+        """
+        dsnparse cannot correctly recognize character
+        `@` in password, so we have this
+        """
+        if data_source.count("@") > 1:
+            data_source = data_source.replace("@", TargetConfig.DSN_PLACEHOLDER, 1)
+        dsn = dsnparse.parse(data_source)
+        for k, v in dsn.__dict__.items():
+            if isinstance(v, str):
+                dsn.__dict__[k] = v.replace(TargetConfig.DSN_PLACEHOLDER, "@")
+        return dsn
+
     def init_db_connection(self) -> DBApi:
         if self.queries is None or len(self.queries) == 0:
             raise Exception("no queries to execute on data source {}".format(self.data_source))
-        dsn = dsnparse.parse(self.data_source)
+        dsn = TargetConfig.safe_parse_dsn(self.data_source)
         if dsn.schemes[0] == "mysql":
             return MyDBApi(dsn)
         else:
@@ -358,7 +375,7 @@ class CollectorConfig(object):
         for query_name in query_names:
             params[query_name] = {}
             # make a deepcopy to avoid modify raw config
-            query_param = deepcopy(Configs.merge_config(common_params, self.query_params[query_name]))
+            query_param = deepcopy(Configs.merge_config(common_params, self.query_params.get(query_name, {})))
             if len(query_param) == 0:
                 print("failed to spawn {} config: spawn result is empty".format(query_name))
             first_loop = True
@@ -418,7 +435,7 @@ class Config(object):
                 config = json.load(file)
                 self.collector = CollectorConfig.load(config["collector"])
         elif self.config_source == "mysql":
-            dbi = MyDBApi(dsnparse.parse(self.source_location))
+            dbi = MyDBApi(TargetConfig.safe_parse_dsn(self.source_location))
             self.collector = CollectorConfig.load(Config._load_from_mydb(dbi, self.config_name))
         else:
             raise Exception("failed to refresh collector config, "
@@ -435,7 +452,7 @@ class Config(object):
                 source_location = config_path
             elif source == "mysql":
                 source_location = config.get("source_location")
-                dbi = MyDBApi(dsnparse.parse(source_location))
+                dbi = MyDBApi(TargetConfig.safe_parse_dsn(source_location))
                 collector_config = Config._load_from_mydb(dbi, config.get("config_name"))
             else:
                 raise Exception("config source {} not supported".format(source))
@@ -498,10 +515,11 @@ class MetricFamily(object):
         for val_label_val in target_ref.values:
             if val_label_val not in row:
                 continue
+            cur_label_values = list(label_values)
             if self.config.val_label is not None and len(self.config.val_label) > 0:
-                label_values.append(val_label_val)
+                cur_label_values.append(val_label_val)
             metric_val = float(row[val_label_val])
-            self.metric.labels(*label_values).set(metric_val)
+            self.metric.labels(*cur_label_values).set(metric_val)
             if need_cache:
                 cache.cache(self.metric, label_values, metric_val)
 
@@ -758,7 +776,7 @@ class Collector(object):
                 tasks.extend(ret)
         # wait for all query completed
         if len(tasks) > 0:
-            wait(tasks, timeout=30, return_when=ALL_COMPLETED)
+            wait(tasks, timeout=300, return_when=ALL_COMPLETED)
         # collect cached last collection
         for cq in cached_queries:
             cq.collect_from_cache()
@@ -766,7 +784,10 @@ class Collector(object):
     def close(self):
         for _, metrics in self.query_mfs.items():
             for metric in metrics:
-                metric.close()
+                try:
+                    metric.close()
+                except KeyError:
+                    pass
 
 
 class DBApi(object):
